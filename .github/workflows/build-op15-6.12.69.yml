@@ -64,10 +64,39 @@ jobs:
           set -euo pipefail
           mkdir kernel artifacts
           cd kernel
+          git config --global http.version HTTP/1.1
+          git config --global http.lowSpeedLimit 1024
+          git config --global http.lowSpeedTime 120
           repo init -u https://android.googlesource.com/kernel/manifest \
             -b "$MANIFEST_COMMIT" --depth=1 --no-clone-bundle
           cp ../manifests/gki/op15-6.12.69.xml .repo/manifests/default.xml
-          repo sync -c --no-tags --no-clone-bundle --fail-fast -j2
+          # Large prebuilt fetches can be interrupted. Reuse the checkout on
+          # retries and skip pinned projects whose objects are already present.
+          sync_ok=0
+          sync_log="$GITHUB_WORKSPACE/artifacts/source-sync.log"
+          for attempt in 1 2 3; do
+            sync_jobs=2
+            if [ "$attempt" -gt 1 ]; then
+              sync_jobs=1
+            fi
+            echo "Source sync attempt $attempt/3 (parallel downloads: $sync_jobs)" | tee -a "$sync_log"
+            if timeout --kill-after=60s 30m repo sync -c --no-tags --no-clone-bundle \
+                --no-manifest-update --optimized-fetch --retry-fetches=2 -j"$sync_jobs" \
+                2>&1 | tee -a "$sync_log"; then
+              sync_ok=1
+              break
+            else
+              sync_status=${PIPESTATUS[0]}
+            fi
+            echo "::warning::Source sync attempt $attempt failed (exit $sync_status)." | tee -a "$sync_log"
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 30))"
+            fi
+          done
+          if [ "$sync_ok" -ne 1 ]; then
+            echo "::error::Source sync failed after 3 attempts. See source-sync.log in the artifacts."
+            exit 1
+          fi
           test "$(git -C common rev-parse HEAD)" = "$ACK_COMMIT"
           python3 - <<'PY'
           import re
