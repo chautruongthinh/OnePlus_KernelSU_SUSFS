@@ -89,6 +89,9 @@ jobs:
         run: |
           set -euo pipefail
           git clone --no-checkout https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          # The pinned revision may no longer be reachable from advertised
+          # branches after an upstream rebase. Fetch it explicitly before checkout.
+          git -C KernelSU-Next fetch --no-tags origin "$KSUN_COMMIT"
           git -C KernelSU-Next checkout --detach "$KSUN_COMMIT"
           test "$(git -C KernelSU-Next rev-parse HEAD)" = "$KSUN_COMMIT"
           ln -s ../../KernelSU-Next/kernel common/drivers/kernelsu
