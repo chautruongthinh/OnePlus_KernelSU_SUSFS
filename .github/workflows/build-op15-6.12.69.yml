@@ -53,7 +53,7 @@ jobs:
           sudo install -m 0755 /tmp/repo /usr/local/bin/repo
           git config --global user.name github-actions
           git config --global user.email github-actions@github.com
-          # ThinLTO can exceed the memory available on a hosted runner.
+          # Keep headroom for parallel compiler jobs and kernel linking.
           sudo fallocate -l 16G /swapfile-op15
           sudo chmod 600 /swapfile-op15
           sudo mkswap /swapfile-op15
@@ -189,21 +189,27 @@ jobs:
         working-directory: kernel
         run: |
           set -euo pipefail
-          flags=(--config=local --lto=thin --jobs=2)
+          # r54's GENDWARFKSYMS requires ELF objects and depends on !LTO.
+          # Preserve the Android16 symbol CRC generator used by stock modules.
+          flags=(--config=local --lto=none --jobs=2)
           if [ "$ROOT_MODE" != stock ]; then
             flags+=(--notrim)
           fi
           tools/bazel run "${flags[@]}" //common:kernel_aarch64_dist \
-            -- --dist_dir="$GITHUB_WORKSPACE/artifacts" 2>&1 | tee ../artifacts/build.log
+            -- --destdir="$GITHUB_WORKSPACE/artifacts" 2>&1 | tee ../artifacts/build.log
 
       - name: Verify and package the kernel
         run: |
           set -euo pipefail
           test -s artifacts/Image
           test -s artifacts/vmlinux
+          # Kleaf exports the complete symbol table with the target prefix.
+          if [ ! -s artifacts/Module.symvers ]; then
+            cp artifacts/kernel_aarch64_Module.symvers artifacts/Module.symvers
+          fi
           test -s artifacts/Module.symvers
           python3 - <<'PY'
-          import re, struct
+          import os, re, struct
           from pathlib import Path
           image = Path('artifacts/Image').read_bytes()
           assert image[56:60] == b'ARM\x64', 'Invalid ARM64 Image header'
@@ -212,6 +218,13 @@ jobs:
           match = re.search(rb'Linux version 6\.12\.69-android16-6[^\x00\n]*',
                             Path('artifacts/vmlinux').read_bytes())
           assert match, 'Built kernel release does not match 6.12.69-android16-6'
+          config = Path('artifacts/kernel_aarch64_dot_config').read_text()
+          for required in ('CONFIG_MODVERSIONS=y', 'CONFIG_GENDWARFKSYMS=y'):
+              assert required in config.splitlines(), f'Missing {required}'
+          if os.environ['ROOT_MODE'] != 'stock':
+              assert 'CONFIG_KSU=y' in config.splitlines(), 'KernelSU is not enabled'
+          if os.environ['ROOT_MODE'] == 'KSUN-SUSFS':
+              assert 'CONFIG_KSU_SUSFS=y' in config.splitlines(), 'SUSFS is not enabled'
           release = match[0].decode(errors='replace')
           Path('artifacts/kernel-version.txt').write_text(release + '\n')
           print(release)
@@ -243,6 +256,7 @@ jobs:
             artifacts/*.zip
             artifacts/Image
             artifacts/Module.symvers
+            artifacts/kernel_aarch64_dot_config
             artifacts/SHA256SUMS
             artifacts/*.txt
             artifacts/*.xml
