@@ -256,6 +256,9 @@ jobs:
           test -s artifacts/kernel_aarch64_Module.symvers
           cp artifacts/kernel_aarch64_Module.symvers artifacts/Module.symvers
           test -s artifacts/Module.symvers
+          if [ "$WILD_FEATURES" = true ]; then
+            python3 scripts/verify-op15-lsm.py artifacts/vmlinux | tee artifacts/lsm-verification.txt
+          fi
           python3 - <<'PY'
           import os, re, struct
           from pathlib import Path

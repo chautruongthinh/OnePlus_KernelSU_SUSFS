@@ -59,6 +59,21 @@ def head(path):
     return subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
 
 
+def reserve_bbg_lsm_slot(text):
+    # Android 6.12 statically sizes both the ordered LSM list and hook slots.
+    # CONFIG_LSM alone does not reserve capacity for an out-of-tree LSM.
+    for old, new in [
+        ('#define MAX_LSM_COUNT\t\t\t\\\n',
+         '#if IS_ENABLED(CONFIG_BBG)\n#define BBG_ENABLED 1,\n'
+         '#else\n#define BBG_ENABLED\n#endif\n\n'
+         '#define MAX_LSM_COUNT\t\t\t\\\n'),
+        ('\t\tIPE_ENABLED)', '\t\tIPE_ENABLED\t\t\\\n\t\tBBG_ENABLED)'),
+    ]:
+        assert text.count(old) == 1, 'Unexpected r54 LSM count context'
+        text = text.replace(old, new, 1)
+    return text
+
+
 def run(args):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('common', type=Path)
@@ -209,6 +224,9 @@ def run(args):
             target.write_text(target.read_text() + addition)
         apply('bbg/0001-Enable-abl-and-efisp-flashing-for-efisp-exploit-devices',
               strip=2, directory=bbg_target)
+        target = prepare('include/linux/lsm_count.h')
+        target.write_text(reserve_bbg_lsm_slot(target.read_text()))
+        applied.append('Baseband Guard static LSM capacity for Android 6.12')
 
         target = prepare('arch/arm64/configs/gki_defconfig')
         text = target.read_text()
