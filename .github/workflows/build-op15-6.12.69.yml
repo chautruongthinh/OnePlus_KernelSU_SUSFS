@@ -8,12 +8,20 @@ on:
         type: choice
         options: [KSUN-SUSFS, KSUN, stock]
         default: KSUN-SUSFS
+      wild_features:
+        description: 'Add r54-compatible WildKernels features (BBG, NTSync, network and tuning)'
+        type: boolean
+        default: true
+      droidspaces:
+        description: 'Experimental Droidspaces namespaces; changes Rust CRCs and may require rebuilt Rust modules'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: op15-6.12.69-${{ github.ref }}-${{ inputs.root_mode }}
+  group: op15-6.12.69-${{ github.ref }}-${{ inputs.root_mode }}-${{ inputs.wild_features }}-${{ inputs.droidspaces }}
   cancel-in-progress: false
 
 env:
@@ -24,6 +32,12 @@ env:
   PATCHES_COMMIT: 6e7d8d8d064ce7e487a23daf7cde581d93ede999
   AK3_COMMIT: 0b46673ae91aee8d60bd6ee257b4d56d3f6a0114
   ROOT_MODE: ${{ inputs.root_mode }}
+  WILD_FEATURES: ${{ inputs.wild_features && inputs.root_mode != 'stock' }}
+  FEATURE_SUFFIX: ${{ inputs.wild_features && inputs.root_mode != 'stock' && '_Wild' || '' }}
+  DROIDSPACES: ${{ inputs.wild_features && inputs.droidspaces && inputs.root_mode != 'stock' }}
+  DROIDSPACES_SUFFIX: ${{ inputs.wild_features && inputs.droidspaces && inputs.root_mode != 'stock' && '_Droidspaces' || '' }}
+  WILD_PATCHES_COMMIT: 44b23a7601b98a3c548e2584e9f294d7b8b2d19b
+  BBG_COMMIT: a54e0dc6cf0aff4dd87fec49644a02d2eb612905
 
 jobs:
   build:
@@ -183,6 +197,25 @@ jobs:
           patch --batch -d kernel/common -p1 --forward < /tmp/op15-susfs-r54.patch
           printf '\nCONFIG_KSU_SUSFS=y\n' >> kernel/common/arch/arm64/configs/gki_defconfig
 
+      - name: Integrate pinned WildKernels features
+        if: inputs.wild_features && inputs.root_mode != 'stock'
+        run: |
+          set -euo pipefail
+          git init wild-kernel-patches
+          git -C wild-kernel-patches remote add origin https://github.com/WildKernels/kernel_patches.git
+          git -C wild-kernel-patches fetch --depth=1 origin "$WILD_PATCHES_COMMIT"
+          git -C wild-kernel-patches checkout --detach FETCH_HEAD
+          git init baseband-guard
+          git -C baseband-guard remote add origin https://github.com/vc-teahouse/Baseband-guard.git
+          git -C baseband-guard fetch --depth=1 origin "$BBG_COMMIT"
+          git -C baseband-guard checkout --detach FETCH_HEAD
+          options=()
+          if [ "$DROIDSPACES" = true ]; then
+            options+=(--droidspaces)
+          fi
+          python3 scripts/apply-op15-wild-features.py kernel/common wild-kernel-patches \
+            baseband-guard artifacts/wild-features.json "${options[@]}" 2>&1 | tee artifacts/wild-features.log
+
       - name: Configure the custom kernel build
         if: inputs.root_mode != 'stock'
         run: |
@@ -219,9 +252,9 @@ jobs:
           test -s artifacts/Image
           test -s artifacts/vmlinux
           # Kleaf exports the complete symbol table with the target prefix.
-          if [ ! -s artifacts/Module.symvers ]; then
-            cp artifacts/kernel_aarch64_Module.symvers artifacts/Module.symvers
-          fi
+          # Refresh the alias even when reusing a local artifacts directory.
+          test -s artifacts/kernel_aarch64_Module.symvers
+          cp artifacts/kernel_aarch64_Module.symvers artifacts/Module.symvers
           test -s artifacts/Module.symvers
           python3 - <<'PY'
           import os, re, struct
@@ -240,6 +273,29 @@ jobs:
               assert 'CONFIG_KSU=y' in config.splitlines(), 'KernelSU is not enabled'
           if os.environ['ROOT_MODE'] == 'KSUN-SUSFS':
               assert 'CONFIG_KSU_SUSFS=y' in config.splitlines(), 'SUSFS is not enabled'
+          if os.environ['WILD_FEATURES'] == 'true':
+              import json
+              features = json.loads(Path('artifacts/wild-features.json').read_text())
+              for key, value in features['required_config'].items():
+                  expected = f'CONFIG_{key}={value}'
+                  if value == 'n':
+                      expected = f'# CONFIG_{key} is not set'
+                  assert expected in config.splitlines(), f'Missing WildKernels option: {expected}'
+              symbols = Path('artifacts/System.map').read_text()
+              required_symbols = ['bbg_init', 'ntsync_init']
+              if os.environ['DROIDSPACES'] == 'true':
+                  required_symbols.append('init_ghost_task')
+                  print('::warning::Experimental Droidspaces changes Rust export CRCs; matching Rust modules may be required.')
+              for symbol in required_symbols:
+                  assert re.search(rf'^[0-9a-f]+ [tT] {symbol}$', symbols, re.M), f'Missing built feature: {symbol}'
+              reference = json.loads(Path('configs/gki/op15-6.12.69-kmi6.json').read_text())
+              versions = {fields[1]: fields[0] for line in Path('artifacts/Module.symvers').read_text().splitlines()
+                          if len(fields := line.split()) >= 2}
+              for symbol, crc in reference['symbols'].items():
+                  assert versions.get(symbol) == crc, f'Baseline CRC changed: {symbol}: {versions.get(symbol)} != {crc}'
+              if os.environ['DROIDSPACES'] != 'true':
+                  for symbol, crc in reference['rust_symbols'].items():
+                      assert versions.get(symbol) == crc, f'Baseline Rust CRC changed: {symbol}'
           release = match[0].decode(errors='replace')
           Path('artifacts/kernel-version.txt').write_text(release + '\n')
           print(release)
@@ -249,15 +305,20 @@ jobs:
           git -C AnyKernel3 fetch --depth=1 origin "$AK3_COMMIT"
           git -C AnyKernel3 checkout --detach FETCH_HEAD
           cp artifacts/Image AnyKernel3/Image
-          zip_name="AK3_OP15_android16-6.12.69_KMI6_4k_${ROOT_MODE}.zip"
+          zip_name="AK3_OP15_android16-6.12.69_KMI6_4k_${ROOT_MODE}${FEATURE_SUFFIX}${DROIDSPACES_SUFFIX}.zip"
           (cd AnyKernel3 && zip -r9 "../artifacts/$zip_name" . -x '.git/*' '.github/*' '.gitignore' 'README.md')
           printf 'ACK=%s\nKSUN=%s\nSUSFS=%s\nPATCHES=%s\nAK3=%s\nROOT_MODE=%s\n' \
             "$ACK_COMMIT" "$KSUN_COMMIT" "$SUSFS_COMMIT" "$PATCHES_COMMIT" "$AK3_COMMIT" "$ROOT_MODE" \
             > artifacts/build-info.txt
+          printf 'WILD_FEATURES=%s\nWILD_PATCHES=%s\nBBG=%s\n' \
+            "$WILD_FEATURES" "$WILD_PATCHES_COMMIT" "$BBG_COMMIT" >> artifacts/build-info.txt
+          printf 'DROIDSPACES=%s\n' "$DROIDSPACES" >> artifacts/build-info.txt
           (cd artifacts && sha256sum Image "$zip_name" > SHA256SUMS)
           {
             echo '### OP15 Android16 6.12.69 (KMI 6, 4KB)'
             echo "Root features: $ROOT_MODE"
+            echo "WildKernels features enabled: $WILD_FEATURES"
+            echo "Experimental Droidspaces enabled: $DROIDSPACES"
             cat artifacts/kernel-version.txt
             echo 'Source and patch checks passed. Device boot compatibility requires testing on the phone.'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -271,7 +332,7 @@ jobs:
       - name: Upload AnyKernel3 ZIP
         uses: actions/upload-artifact@v7
         with:
-          path: artifacts/AK3_OP15_android16-6.12.69_KMI6_4k_${{ inputs.root_mode }}.zip
+          path: artifacts/AK3_OP15_android16-6.12.69_KMI6_4k_${{ inputs.root_mode }}${{ env.FEATURE_SUFFIX }}${{ env.DROIDSPACES_SUFFIX }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
@@ -293,6 +354,7 @@ jobs:
             artifacts/kernel_aarch64_dot_config
             artifacts/*.txt
             artifacts/*.xml
+            artifacts/*.json
             artifacts/*.log
           if-no-files-found: warn
           retention-days: 7

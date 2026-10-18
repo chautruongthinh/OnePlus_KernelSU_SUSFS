@@ -10,6 +10,12 @@
 
 </div>
 
+For **OnePlus 15 ColorOS, Android16 6.12.69 / KMI 6 / 4KB**, use the
+dedicated **Build OP15 6.12.69 Android16 KMI6** workflow and the
+[OP15 build guide](OP15-6.12.69.md). Its `wild_features` option adds the
+ported WildKernels feature set; `droidspaces` is a separate experimental
+option and defaults to off.
+
 ---
 
 ## ⚠️ Disclaimer

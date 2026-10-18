@@ -5,3 +5,4 @@
 *.Identifier
 *.orig
 *.rej
+__pycache__/
