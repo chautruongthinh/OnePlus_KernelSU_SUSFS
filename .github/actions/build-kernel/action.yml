@@ -789,13 +789,17 @@ runs:
               aria_log_flags="--summary-interval=5" # Show progress every 5s in debug
           fi
           
-          local aria2_headers=(
-            "--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            "--header=Accept: */*"
-            "--header=Connection: keep-alive"
+          local user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          local aria2_args=(
+            --user-agent="$user_agent"
+            --header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/octet-stream,*/*;q=0.8"
+            --header "Accept-Language: en-US,en;q=0.9"
+            --header "Sec-Fetch-Dest: document"
+            --header "Sec-Fetch-Mode: navigate"
+            --header "Sec-Fetch-Site: none"
+            --header "Sec-Fetch-User: ?1"
+            --header "Upgrade-Insecure-Requests: 1"
           )
-          
-          local browser_ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
           
           # aria2c (parallel) for GitHub; plain curl for GitLab.
           # gitlab.com's web archive endpoint sits behind a Cloudflare bot
@@ -806,9 +810,8 @@ runs:
           if [[ "$url" == *"github.com"* ]]; then
               download_url="${url%.git}/archive/refs/heads/${branch}.tar.gz"
           elif [[ "$url" == *"gitlab.com"* ]]; then
-              local project_path="${url#https://gitlab.com/}"
-              project_path="${project_path%.git}"
-              download_url="https://gitlab.com/api/v4/projects/${project_path//\//%2F}/repository/archive.tar.gz?sha=${branch}"
+              local project_path=$(echo "$url" | sed -E 's#^https?://gitlab\.com/##; s#\.git$##; s#/#%2F#g')
+              download_url="https://gitlab.com/api/v4/projects/${project_path}/repository/archive.tar.gz?sha=${branch}"
               dl_method="curl"
           else
               echo "::error::Unsupported host: $url"
@@ -816,18 +819,24 @@ runs:
           fi
           
           while [ $attempt -le $max_attempts ]; do
+              local conn=1
+              case $attempt in
+                1) conn=16 ;;
+                2) conn=4 ;;
+                *) conn=1 ;;
+              esac
               echo " Attempt $attempt/$max_attempts: High-speed fetch for $repo_name ($branch)"
               
               local dl_ok=0
               if [ "$dl_method" = "curl" ] || ! command -v aria2c >/dev/null 2>&1; then
                 if curl -fLsS --retry 5 --retry-delay 3 --retry-all-errors \
-                     -H "User-Agent: $browser_ua" \
+                     -H "User-Agent: $user_agent" \
                      -H "Accept: */*" \
                      -o "$shm_path" "$download_url"; then
                   dl_ok=1
                 fi
               else
-                if aria2c -x16 -s16 -j16 -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
+                if aria2c -x"$conn" -s"$conn" -j16 -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_args[@]}" $aria_log_flags "$download_url"; then
                   dl_ok=1
                 fi
               fi
