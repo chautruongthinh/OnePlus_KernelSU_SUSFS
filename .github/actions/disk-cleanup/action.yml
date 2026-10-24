@@ -1,11 +1,11 @@
 name: 'Disk Cleanup'
+description: Free disk space before OnePlus vendor kernel builds
 
 inputs:
   debug:
     description: 'Enable Logs'
     required: false
-    type: boolean
-    default: false
+    default: 'false'
 
 runs:
   using: 'composite'

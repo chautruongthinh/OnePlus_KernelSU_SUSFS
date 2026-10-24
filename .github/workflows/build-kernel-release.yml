@@ -18,6 +18,7 @@ on:
         type: choice
         options:
           - OP15
+          - OP15-6.12.69
           - A14+15+16
           - A15+16
           - A14+15
@@ -109,16 +110,27 @@ jobs:
         with:
           sparse-checkout: |
             configs/
+            scripts/
           sparse-checkout-cone-mode: false
 
       - name: 🔍 Generate build matrix
         id: set-matrix
         shell: bash
+        env:
+          OP15_KSU_OPTIONS: ${{ inputs.ksu_options }}
+          OP15_SUSFS_REF: ${{ inputs.android16-6_12_susfs_branch_or_commit }}
+          OP15_OPTIMIZE: ${{ inputs.optimize_level }}
+          OP15_TIMESTAMP: ${{ inputs.build_timestamp }}
         run: |
           set -euo pipefail
           echo "::group::Matrix generation"
           
           input="${{ github.event.inputs.op_model }}"
+          if [ "$input" = OP15-6.12.69 ]; then
+            python3 scripts/op15-gki-profile.py matrix
+            echo '::endgroup::'
+            exit 0
+          fi
           ksu_options_raw='${{ github.event.inputs.ksu_options }}'
           if ! ksu_options_normalized=$(echo "$ksu_options_raw" | jq -c 'map(if .type then .type |= ascii_upcase | if .hash == null then if .type == "KSUN" then .hash = "dev" elif .type == "KSU" then .hash = "main" else .hash end else . end else error("No type found") end)' 2>&1); then
             echo "::error::ksu_options validation failed: $ksu_options_normalized"
@@ -127,19 +139,12 @@ jobs:
           
           echo "ksu_options_normalized=$ksu_options_normalized" >> $GITHUB_OUTPUT
           
-          echo "[" > matrix.json
-          mapfile -t all_json_files < <(find configs/ -name "*.json" -print0 | xargs -0 -n1)
-          for i in "${!all_json_files[@]}"; do
-            file="${all_json_files[$i]}"
-            if [ -f "$file" ]; then
-              jq -r '.' "$file" >> matrix.json
-              if [ $((i+1)) -lt ${#all_json_files[@]} ]; then
-                echo "," >> matrix.json
-              fi
-            fi
-          done
-          echo "]" >> matrix.json
-          
+          # Only device configs belong in the legacy matrix. CRC/pin references
+          # and the explicit r54 profile are not multi-device vendor targets.
+          mapfile -t all_json_files < <(find configs/ -name '*.json' | sort)
+          jq -s '[.[] | select(.model? and .os_version? and
+            ((.build_profile // "legacy") == "legacy"))]' "${all_json_files[@]}" > matrix.json
+
           jq_filter="."
           
           case "$input" in
@@ -544,11 +549,12 @@ jobs:
 
   mirror_toolchain:
     needs: set-op-model
-    if: ${{ inputs.mirror_toolchains }}
+    if: ${{ inputs.mirror_toolchains && inputs.op_model != 'OP15-6.12.69' }}
     uses: ./.github/workflows/mirror-toolchains.yml
     secrets: inherit
 
   prepare_ccache:
+    if: inputs.op_model != 'OP15-6.12.69'
     name: Prepare ccache binary (download once)
     runs-on: ubuntu-latest
     steps:
@@ -595,13 +601,13 @@ jobs:
       !cancelled() &&
       needs.set-op-model.result == 'success' &&
       (needs.mirror_toolchain.result == 'success' || needs.mirror_toolchain.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.build_profile == 'op15-gki-r54' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.set-op-model.outputs.matrix) }}
     outputs:
-      ksun_ver: ${{ steps.build-stat.outputs.ksu_version }}
-      ksu_ver: ${{ steps.build-stat.outputs.ksu_version }}
+      ksun_ver: ${{ steps.build-stat.outputs.ksun_ver }}
+      ksu_ver: ${{ steps.build-stat.outputs.ksu_ver }}
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v6
@@ -626,6 +632,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Get prebuilt ccache (downloaded once by prepare_ccache)
+        if: matrix.build_profile != 'op15-gki-r54'
         uses: actions/download-artifact@v8
         with:
           name: ccache-binary
@@ -633,6 +640,7 @@ jobs:
         continue-on-error: true
 
       - name: Install ccache (ECS by cctv18, shared via artifact)
+        if: matrix.build_profile != 'op15-gki-r54'
         run: |
           set -uo pipefail
           echo "::group::Install ccache"
@@ -650,6 +658,7 @@ jobs:
           echo "::endgroup::"
 
       - name: ♻️ Configure ccache (bounded)
+        if: matrix.build_profile != 'op15-gki-r54'
         run: |
           echo "::group::Configure ccache environment"
           set -euo pipefail

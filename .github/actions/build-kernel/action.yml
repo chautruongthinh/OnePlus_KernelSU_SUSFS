@@ -1,52 +1,41 @@
 name: 'Build OnePlus Kernel with KernelSU Next'
+description: Build OnePlus vendor kernels or the pinned OP15 6.12.69 GKI profile
 
 inputs:
   op_config_json:
     description: 'JSON string containing full device config'
     required: true
-    type: string
   ksu_type:
     description: 'Select KSU Type'
     required: true
-    type: choice
-    options:
-      - KSUN
-      - KSU
   ksu_branch_or_hash:
     description: 'KSU branch or commit hash (empty = auto-detect by ksu_type)'
     required: false
-    type: string
     default: ""
   susfs_commit_hash_or_branch:
     description: 'SUSFS branch or commit hash (empty = auto-detect by kernel version)'
     required: false
-    type: string
     default: ""
   kernel_patches_repo:
     description: 'kernel_patches repository URL holding the feature/fix patches'
     required: false
-    type: string
     default: "https://github.com/WildKernels/kernel_patches.git"
   build_timestamp:
     description: 'Custom kernel build timestamp shown in uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty to use the current build time.'
     required: false
-    type: string
     default: ''
   optimize_level:
     description: 'Compiler optimization level (O2 or O3)'
     required: false
-    type: string
     default: O2
   clean:
     description: 'Force clean build without ccache acceleration'
     required: false
-    type: boolean
-    default: false
+    default: 'false'
   debug:
     description: 'Enable dumping debug related artifacts'
     required: false
-    type: boolean
-    default: false
+    default: 'false'
   github_token:
     description: 'GitHub Token'
     required: true
@@ -54,45 +43,68 @@ inputs:
 outputs:
   kernel_version:
     description: 'Full kernel version string'
-    value: ${{ steps.save_metadata.outputs.kernel_version }}
+    value: ${{ steps.op15.outputs.kernel_version || steps.save_metadata.outputs.kernel_version }}
   ksu_version:
     description: 'KernelSU version number'
-    value: ${{ steps.save_metadata.outputs.ksu_version }}
+    value: ${{ steps.op15.outputs.ksu_version || steps.save_metadata.outputs.ksu_version }}
   ksu_type:
     description: 'KernelSU Variant'
-    value: ${{ steps.save_metadata.outputs.ksu_type }}
+    value: ${{ steps.op15.outputs.ksu_type || steps.save_metadata.outputs.ksu_type }}
   susfs_version:
     description: 'SUSFS version string'
-    value: ${{ steps.save_metadata.outputs.susfs_version }}
+    value: ${{ steps.op15.outputs.susfs_version || steps.save_metadata.outputs.susfs_version }}
   build_timestamp:
     description: 'Effective kernel build timestamp used in uname -a'
-    value: ${{ steps.save_metadata.outputs.build_timestamp }}
+    value: ${{ steps.op15.outputs.build_timestamp || steps.save_metadata.outputs.build_timestamp }}
   image_sha256:
     description: 'SHA256 hash of kernel Image'
-    value: ${{ steps.collect_stats.outputs.image_sha256 }}
+    value: ${{ steps.op15.outputs.image_sha256 || steps.collect_stats.outputs.image_sha256 }}
   zip_sha256:
     description: 'SHA256 hash of AnyKernel3 Zip'
-    value: ${{ steps.create_zip.outputs.zip_sha256 }}
+    value: ${{ steps.op15.outputs.zip_sha256 || steps.create_zip.outputs.zip_sha256 }}
   warnings:
     description: 'Number of compiler warnings'
-    value: ${{ steps.collect_stats.outputs.warnings_count }}
+    value: ${{ steps.op15.outputs.warnings || steps.collect_stats.outputs.warnings_count }}
   build_time:
     description: 'Total build time in seconds'
-    value: ${{ steps.collect_stats.outputs.build_time }}
+    value: ${{ steps.op15.outputs.build_time || steps.collect_stats.outputs.build_time }}
   ccache_hit_rate:
     description: 'ccache hit rate percentage'
-    value: ${{ steps.ccache_stats.outputs.hit_rate }}
+    value: ${{ steps.op15.outputs.ccache_hit_rate || steps.ccache_stats.outputs.hit_rate }}
   ccache_direct_rate:
     description: 'ccache direct hit rate percentage'
-    value: ${{ steps.ccache_stats.outputs.direct_rate }}
+    value: ${{ steps.op15.outputs.ccache_direct_rate || steps.ccache_stats.outputs.direct_rate }}
   zip_name:
     description: 'Name of the generated flashable ZIP'
-    value: ${{ steps.create_zip.outputs.zip_name }}
+    value: ${{ steps.op15.outputs.zip_name || steps.create_zip.outputs.zip_name }}
 
 runs:
   using: 'composite'
   steps:
+    - name: Select kernel build profile
+      id: profile
+      shell: bash
+      env:
+        OP15_CONFIG_JSON: ${{ inputs.op_config_json }}
+        OP15_KSU_TYPE: ${{ inputs.ksu_type }}
+        OP15_KSU_REF: ${{ inputs.ksu_branch_or_hash }}
+        OP15_SUSFS_REF: ${{ inputs.susfs_commit_hash_or_branch }}
+        OP15_OPTIMIZE: ${{ inputs.optimize_level }}
+        OP15_TIMESTAMP: ${{ inputs.build_timestamp }}
+      run: python3 scripts/op15-gki-profile.py route
+
+    - name: Build OP15 6.12.69 Android16 KMI6
+      id: op15
+      if: steps.profile.outputs.op15 == 'true'
+      uses: ./.github/actions/build-op15-gki
+      with:
+        root_mode: ${{ steps.profile.outputs.root_mode }}
+        wild_features: ${{ steps.profile.outputs.wild_features }}
+        droidspaces: ${{ steps.profile.outputs.droidspaces }}
+        artifact_style: common
+
     - name: Get Action info
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       env:
         ACTION_REPO_VAL: ${{ github.action_repository }}
@@ -103,6 +115,7 @@ runs:
         echo "ACTION_REF=$ACTION_REF_VAL" >> $GITHUB_ENV
 
     - name: 📥 Checkout Code
+      if: steps.profile.outputs.op15 == 'false'
       uses: actions/checkout@v6
       with:
         repository: ${{ env.ACTION_REPO }}
@@ -111,6 +124,7 @@ runs:
         fetch-depth: 1
 
     - name: Parse op_config_json
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -120,6 +134,7 @@ runs:
         jq '.' /tmp/config.json
 
     - name: Validate Inputs
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -320,6 +335,7 @@ runs:
         echo "::endgroup::"
 
     - name: Setup Base Environment
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -335,6 +351,7 @@ runs:
         echo "REPO=$REPO" >> "$GITHUB_ENV"
 
     - name: Optimize Global Git for Repo Tool
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -344,6 +361,7 @@ runs:
         git config --global http.sslVerify false
 
     - name: Sync Kernel Source
+      if: steps.profile.outputs.op15 == 'false'
       id: sync-kernel-source
       uses: ./action-source/.github/actions/kernel-source-sync
       with:
@@ -352,6 +370,7 @@ runs:
         debug: ${{ inputs.debug }}
 
     - name: Set Dir Paths
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -386,6 +405,7 @@ runs:
         echo "DEBUG_ZIP_NAME=$DEBUG_ZIP_NAME" >> "$GITHUB_ENV"
 
     - name: Set Kernel build-tools to Path
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         # Set Kernel build-tools to Path
@@ -394,6 +414,7 @@ runs:
         echo "${KERNEL_PLATFORM_FOLDER}/prebuilts/kernel-build-tools/linux_musl-x86/bin/" >> $GITHUB_PATH
 
     - name: Get Kernel Version Info
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -447,6 +468,7 @@ runs:
         echo "::endgroup::"
 
     - name: 🏷️ Set Build Identity (Hardcoded)
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -465,6 +487,7 @@ runs:
         echo "::endgroup::"
 
     - name: Check or Detect Clang
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         # Check or Detect Clang
@@ -587,7 +610,7 @@ runs:
 
     - name: Check or Detect Rust & bindgen
       shell: bash
-      if: ${{ env.OP_RUST_BUILD == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_RUST_BUILD == 'true') }}
       run: |
         # Check or Detect Rust & bindgen
         set -euo pipefail
@@ -653,7 +676,7 @@ runs:
 
     - name: Install bindgen only (no rustc)
       shell: bash
-      if: ${{ env.OP_RUST_BUILD == 'true'  && !env.BINDGEN_BIN_PATH }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_RUST_BUILD == 'true'  && !env.BINDGEN_BIN_PATH) }}
       run: |
         # Install bindgen via cargo (no full rustc needed)
         set -euo pipefail
@@ -675,7 +698,7 @@ runs:
 
     - name: Test Rust & bindgen
       shell: bash
-      if: ${{ env.OP_RUST_BUILD == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_RUST_BUILD == 'true') }}
       run: |
         # Test Rust & bindgen
         set -euo pipefail
@@ -688,7 +711,7 @@ runs:
     - name: Restore ccache cache
       id: restore-ccache-cache
       uses: ./action-source/.github/actions/cache/restore
-      if: ${{ inputs.clean == false || inputs.clean == 'false' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (inputs.clean == false || inputs.clean == 'false') }}
       with:
         cache_path: ${{ env.CCACHE_DIR }}
         cache_key: ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
@@ -699,6 +722,7 @@ runs:
           ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
 
     - name: Check and Prepare Caches
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         echo "::group::Check ccache"
@@ -738,6 +762,7 @@ runs:
         echo "::endgroup::"
 
     - name: Fetch SusFS and Other Dependencies
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         echo "::group::Fetch dependencies"
@@ -909,6 +934,7 @@ runs:
         echo "::endgroup::"
 
     - name: Clean Up ABI Protected Exports
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         echo "::group::Clean Up ABI Protected Exports"
@@ -920,7 +946,7 @@ runs:
 
     - name: Add KernelSU Next
       shell: bash
-      if: ${{ inputs.ksu_type == 'KSUN' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (inputs.ksu_type == 'KSUN') }}
       run: |
         set -euo pipefail
         echo "::group::Add KernelSU Next"
@@ -986,7 +1012,7 @@ runs:
 
     - name: Add KernelSU
       shell: bash
-      if: ${{ inputs.ksu_type == 'KSU' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (inputs.ksu_type == 'KSU') }}
       run: |
         set -euo pipefail
         echo "::group::Add KernelSU"
@@ -1038,7 +1064,7 @@ runs:
 
     - name: Apply SUSFS Patches
       shell: bash
-      if: ${{ env.OP_SUSFS == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_SUSFS == 'true') }}
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS patches"
@@ -1372,7 +1398,7 @@ runs:
         echo "::endgroup::"
 
     - name: Add BBG
-      if: ${{ env.OP_BBG == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_BBG == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1397,7 +1423,7 @@ runs:
 
     - name: Apply KSU Hooks
       shell: bash
-      if: ${{ env.NEED_HOOKS == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.NEED_HOOKS == 'true') }}
       run: |
         set -euo pipefail
         echo "::group::Apply KSU hooks"
@@ -1407,6 +1433,7 @@ runs:
         echo "::endgroup::"
 
     - name: Apply Other Patches
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -1538,7 +1565,7 @@ runs:
         echo "::endgroup::"
 
     - name: Apply Optimisation Patches
-      if: ${{ env.OP_OPT == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_OPT == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1605,7 +1632,7 @@ runs:
 
     - name: Apply NTSync Patch
       shell: bash
-      if: ${{ env.OP_NTSYNC == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_NTSYNC == 'true') }}
       run: |
         set -euo pipefail
         echo "::group::Apply NTSync patch"
@@ -1657,7 +1684,7 @@ runs:
 
     - name: Apply Unicode Fix Patch
       shell: bash
-      if: ${{ env.OP_UNICODE == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_UNICODE == 'true') }}
       run: |
         set -euo pipefail
         echo "::group::Apply Unicode Fix patch"
@@ -1673,6 +1700,7 @@ runs:
         fi
 
     - name: Add Tmpfs Support
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -1683,7 +1711,7 @@ runs:
         EOF
 
     - name: Add BBR
-      if: ${{ env.OP_BBR == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_BBR == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1694,7 +1722,7 @@ runs:
         EOF
 
     - name: Apply BBRv3
-      if: ${{ env.OP_BBR3 == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_BBR3 == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1717,6 +1745,7 @@ runs:
         echo "::endgroup::"
 
     - name: Enable Important Net Schedulers (qdisc)
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -1730,7 +1759,7 @@ runs:
         EOF
 
     - name: Add TTL Target Support
-      if: ${{ env.OP_TTL == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_TTL == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1742,7 +1771,7 @@ runs:
         EOF
 
     - name: Add IP SET & IPv6_NAT Support
-      if: ${{ env.OP_IP_SET == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_IP_SET == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1783,7 +1812,7 @@ runs:
 
     - name: Add Droidspaces support
       shell: bash
-      if: ${{ env.OP_DS == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_DS == 'true') }}
       run: |
         echo "::group::Add Droidspaces Support"
         set -euo pipefail
@@ -1838,6 +1867,7 @@ runs:
         echo "::endgroup::"
 
     - name: Add Build based configs
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -1852,7 +1882,7 @@ runs:
 
     - name: Add RUST build configs
       shell: bash
-      if: ${{ env.OP_RUST_BUILD == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.OP_RUST_BUILD == 'true') }}
       run: |
         set -euo pipefail
         echo "Add Build based configs"
@@ -1862,6 +1892,7 @@ runs:
         EOF
 
     - name: Save Build Metadata
+      if: steps.profile.outputs.op15 == 'false'
       id: save_metadata
       shell: bash
       run: |
@@ -1877,6 +1908,7 @@ runs:
         fi
 
     - name: Customize Kernel Branding
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -1888,13 +1920,14 @@ runs:
 
     - name: Disable GPUEB
       shell: bash
-      if: ${{ env.KERNEL_VER == '5.10' && (startsWith(env.OP_SOC, 'dimensity') || startsWith(env.OP_SOC, 'helio')) }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (env.KERNEL_VER == '5.10' && (startsWith(env.OP_SOC, 'dimensity') || startsWith(env.OP_SOC, 'helio'))) }}
       run: |
         set -euo pipefail
         echo "Disabling GPUEB for MTK kernel 5.10"
         sed -i '/obj-y.*gpueb/d' "$COMMON_KERNEL_FOLDER/drivers/gpu/mediatek/Makefile"
 
     - name: Apply Fake config.gz patch
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -1916,6 +1949,7 @@ runs:
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
     
     - name: Disable Vendor / Kernel Modules
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -1980,6 +2014,7 @@ runs:
         fi
         
     - name: Build Kernel
+      if: steps.profile.outputs.op15 == 'false'
       id: build_kernel_step
       shell: bash
       env:
@@ -2191,7 +2226,7 @@ runs:
 
     - name: 📊 ccache Post-Build Statistics
       id: ccache_stats
-      if: ${{ success() && (inputs.clean == false || inputs.clean == 'false') }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (success() && (inputs.clean == false || inputs.clean == 'false')) }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2260,6 +2295,7 @@ runs:
         echo '```' >> $GITHUB_STEP_SUMMARY
 
     - name: Collect Build Stats / Validate Image
+      if: steps.profile.outputs.op15 == 'false'
       id: collect_stats
       shell: bash
       run: |
@@ -2317,6 +2353,7 @@ runs:
         echo "::endgroup::"
 
     - name: Create Kernel ZIP
+      if: steps.profile.outputs.op15 == 'false'
       id: create_zip
       shell: bash
       run: |
@@ -2387,6 +2424,7 @@ runs:
         echo "::endgroup::"
 
     - name: Final Build Summary
+      if: steps.profile.outputs.op15 == 'false'
       shell: bash
       run: |
         set -euo pipefail
@@ -2519,7 +2557,7 @@ runs:
         } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Upload Debug Artifacts
-      if: ${{ always() && !cancelled() && inputs.debug == 'true' }}
+      if: ${{ steps.profile.outputs.op15 == 'false' && (always() && !cancelled() && inputs.debug == 'true') }}
       uses: actions/upload-artifact@v7
       with:
         name: ${{ env.DEBUG_ZIP_NAME }}
@@ -2528,7 +2566,7 @@ runs:
         retention-days: 90
 
     - name: Upload Artifacts
-      if: success() && steps.create_zip.conclusion == 'success'
+      if: ${{ steps.profile.outputs.op15 == 'false' && (success() && steps.create_zip.conclusion == 'success') }}
       uses: actions/upload-artifact@v7
       with:
         name: ${{ env.ZIP_NAME }}
@@ -2538,7 +2576,7 @@ runs:
         retention-days: 90
 
     - name: Upload ccache log
-      if: success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success'
+      if: ${{ steps.profile.outputs.op15 == 'false' && (success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success') }}
       uses: actions/upload-artifact@v7
       with:
         name: "${{ env.OP_MODEL }}_${{ env.OP_OS_VERSION }}_${{ env.KERNEL_FULL_VER }}_ccache.log"
@@ -2549,13 +2587,13 @@ runs:
 
     - name: 📥 Checkout Code
       uses: actions/checkout@v6
-      if: always() && steps.build_kernel_step.conclusion == 'success'
+      if: ${{ steps.profile.outputs.op15 == 'false' && (always() && steps.build_kernel_step.conclusion == 'success') }}
       with:
         path: main-source
         fetch-depth: 1
 
     - name: Save ccache cache
-      if: always() && steps.build_kernel_step.conclusion == 'success'
+      if: ${{ steps.profile.outputs.op15 == 'false' && (always() && steps.build_kernel_step.conclusion == 'success') }}
       uses: ./action-source/.github/actions/cache/save
       with:
         cache_path: ${{ env.CCACHE_DIR }}
