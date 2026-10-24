@@ -1,47 +1,37 @@
 name: 'Build OnePlus Kernel with KernelSU Next'
+description: 'Build OnePlus vendor kernels or OP15 r54 Android16 6.12.69 with KernelSU and SUSFS'
 
 inputs:
   op_config_json:
     description: 'JSON string containing full device config'
     required: true
-    type: string
   ksu_type:
     description: 'Select KSU Type'
     required: true
-    type: choice
-    options:
-      - KSUN
-      - KSU
   ksu_branch_or_hash:
     description: 'KSU branch or commit hash (empty = auto-detect by ksu_type)'
     required: false
-    type: string
     default: ""
   susfs_commit_hash_or_branch:
     description: 'SUSFS branch or commit hash (empty = auto-detect by kernel version)'
     required: false
-    type: string
     default: ""
   build_timestamp:
     description: 'Custom kernel build timestamp shown in uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty to use the current build time.'
     required: false
-    type: string
     default: ''
   optimize_level:
     description: 'Compiler optimization level (O2 or O3)'
     required: false
-    type: string
     default: O2
   clean:
     description: 'Force clean build without ccache acceleration'
     required: false
-    type: boolean
-    default: false
+    default: 'false'
   debug:
     description: 'Enable dumping debug related artifacts'
     required: false
-    type: boolean
-    default: false
+    default: 'false'
   github_token:
     description: 'GitHub Token'
     required: true
@@ -107,9 +97,11 @@ runs:
 
     - name: Parse op_config_json
       shell: bash
+      env:
+        CONFIG_JSON: ${{ inputs.op_config_json }}
       run: |
         set -euo pipefail
-        echo '${{ inputs.op_config_json }}' > /tmp/config.json
+        printf '%s\n' "$CONFIG_JSON" > /tmp/config.json
         jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
         echo "Parsed config:"
         jq '.' /tmp/config.json
@@ -297,6 +289,12 @@ runs:
           errors+=("Input 'ntsync' contains invalid characters. Allowed: 'true' or 'false'. Got: '$ntsync'")
         fi
         
+        if [ "$model" = OP15-6.12.69 ]; then
+          [ "$android_version-$kernel_version" = android16-6.12 ] || errors+=("OP15 r54 requires android16-6.12")
+          [ "$lto" = none ] || errors+=("OP15 r54 requires LTO none for GENDWARFKSYMS")
+          [ "$ds" = false ] || errors+=("Droidspaces is not enabled for the r54 stock-module profile")
+        fi
+
         case "$optimize" in
           O2|O3) ;;
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
@@ -338,8 +336,41 @@ runs:
         git config --global pack.sparse true
         git config --global http.sslVerify false
 
+    - name: Sync OP15 r54 source and matching toolchains
+      if: ${{ env.OP_MODEL == 'OP15-6.12.69' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$GITHUB_WORKSPACE/$CONFIG"
+        available=$(df -Pk . | awk 'NR==2 {print $4}')
+        if [ "$available" -lt $((45 * 1024 * 1024)) ]; then
+          echo '::error::OP15 r54 needs at least 45GiB free before source sync.'
+          df -h .
+          exit 1
+        fi
+        git config --global user.name github-actions
+        git config --global user.email github-actions@github.com
+        repo init -u https://android.googlesource.com/kernel/manifest \
+          -b 76bdc0766742b0fd58b572bbbb5e204201362f1d --depth=1 --no-clone-bundle
+        cp "$GITHUB_WORKSPACE/action-source/manifests/a16/$OP_MANIFEST" .repo/manifests/default.xml
+        synced=false
+        for attempt in 1 2 3; do
+          if repo sync -c --no-tags --no-clone-bundle --no-manifest-update \
+              --optimized-fetch --retry-fetches=2 -j2; then
+            synced=true
+            break
+          fi
+          sleep "$((attempt * 10))"
+        done
+        [ "$synced" = true ]
+        test "$(git -C kernel_platform/common rev-parse HEAD)" = 242e1a07f8782987c579929a20a74c0b26e88608
+        test "$(make -s -C kernel_platform/common kernelversion)" = 6.12.69
+        grep -qx 'KMI_GENERATION=6' kernel_platform/common/build.config.constants
+        repo manifest -r -o source-manifest.xml
+
     - name: Sync Kernel Source
       id: sync-kernel-source
+      if: env.OP_MODEL != 'OP15-6.12.69'
       uses: ./action-source/.github/actions/kernel-source-sync
       with:
         source_location: ${{ env.CONFIG }}
@@ -556,6 +587,10 @@ runs:
         fi
         
         [ "$CLANG_FOUND" = true ] || { echo "::error::No clang toolchain found"; exit 1; }
+        if [ "$OP_MODEL" = OP15-6.12.69 ] && [ "$CLANG_BIN" != "$CONFIG_FOLDER/$OP_C_COMPILER" ]; then
+          echo '::error::OP15 r54 must use the clang-r536225 toolchain from its manifest.'
+          exit 1
+        fi
         
         echo "CLANG_BIN_PATH=$CLANG_BIN" >> "$GITHUB_ENV"
         
@@ -677,6 +712,11 @@ runs:
         echo "::group::Test Rust & bindgen"
         cd "$COMMON_KERNEL_FOLDER"
         export RUSTTARGET="aarch64-linux-android"
+        if [ "$OP_MODEL" = OP15-6.12.69 ]; then
+          make ARCH=arm64 LLVM=1 V=1 rustavailable
+          echo "::endgroup::"
+          exit 0
+        fi
         make V=1 rustavailable
         echo "::endgroup::"
 
@@ -734,6 +774,8 @@ runs:
 
     - name: Fetch SusFS and Other Dependencies
       shell: bash
+      env:
+        SELECTED_SUSFS_REF: ${{ inputs.susfs_commit_hash_or_branch }}
       run: |
         echo "::group::Fetch dependencies"
         set -euo pipefail
@@ -742,7 +784,7 @@ runs:
         
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           # Determine SUSFS branch/commit to use
-          SUSFS_INPUT="${{ inputs.susfs_commit_hash_or_branch }}"
+          SUSFS_INPUT="$SELECTED_SUSFS_REF"
           
           # Default SUSFS branches for each kernel version
           declare -A DEFAULT_SUSFS=(
@@ -871,7 +913,18 @@ runs:
         
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           echo "Using SUSFS branch/commit: $SUSFS_BRANCH"
-          if ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
+          if [ "$OP_MODEL" = OP15-6.12.69 ]; then
+            response=$(curl -fLsS --retry 3 --retry-all-errors --get \
+              https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/commits \
+              --data-urlencode "ref_name=$SUSFS_BRANCH" --data-urlencode per_page=1)
+            SUSFS_BRANCH=$(jq -er '.[0].id | select(test("^[0-9a-f]{40}$"))' <<< "$response")
+            curl -fLsS --retry 3 --retry-all-errors --get \
+              https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/archive.tar.gz \
+              --data-urlencode "sha=$SUSFS_BRANCH" -o "$RUNNER_TEMP/op15-susfs.tar.gz"
+            mkdir -p "$SUSFS_FOLDER"
+            tar -xzf "$RUNNER_TEMP/op15-susfs.tar.gz" --strip-components=1 -C "$SUSFS_FOLDER"
+            rm -f "$RUNNER_TEMP/op15-susfs.tar.gz"
+          elif ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
             echo "::error::Failed to fetch SUSFS archive after multiple attempts"
             exit 1
           fi
@@ -880,7 +933,41 @@ runs:
         echo "✅ Dependencies cloned"
         echo "::endgroup::"
 
+    - name: Adapt WildKernels patch contexts for OP15 r54
+      if: ${{ env.OP_MODEL == 'OP15-6.12.69' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import difflib, os
+        from pathlib import Path
+        patches = Path(os.environ['KERNEL_PATCHES_FOLDER']) / 'common'
+        replacements = {
+            'optimized_mem_operations.patch': [(' #include <asm/word-at-a-time.h>\n #include <asm/page.h>',
+                                                ' #include <linux/unaligned.h>\n #include <asm/word-at-a-time.h>')],
+            'clear_page_16bytes_align.patch': [('SYM_FUNC_START_PI(clear_page)', 'SYM_FUNC_START(__pi_clear_page)')],
+            'increase_sk_mem_packets.patch': [('SK_WMEM_DEFAULT', 'SK_WMEM_MAX'), ('SK_RMEM_DEFAULT', 'SK_RMEM_MAX')],
+        }
+        for name, pairs in replacements.items():
+            path = patches / name
+            text = path.read_text()
+            for old, new in pairs:
+                if old not in text:
+                    raise ValueError(f'Patch context changed: {name}: {old}')
+                text = text.replace(old, new)
+            path.write_text(text)
+        path = Path(os.environ['COMMON_KERNEL_FOLDER']) / 'fs/f2fs/f2fs.h'
+        old = path.read_text()
+        before = '/* congestion wait timeout value, default: 20ms */\n#define\tDEFAULT_IO_TIMEOUT\t(msecs_to_jiffies(20))'
+        after = before.replace('20ms', '6ms').replace('jiffies(20)', 'jiffies(6)')
+        assert old.count(before) == 1, 'Unexpected r54 f2fs timeout context'
+        patch = ''.join(difflib.unified_diff(old.splitlines(True), old.replace(before, after).splitlines(True),
+                                           fromfile='a/fs/f2fs/f2fs.h', tofile='b/fs/f2fs/f2fs.h'))
+        (patches / 'f2fs_reduce_congestion.patch').write_text(patch)
+        PY
+
     - name: Clean Up ABI Protected Exports
+      if: ${{ env.OP_MODEL != 'OP15-6.12.69' }}
       shell: bash
       run: |
         echo "::group::Clean Up ABI Protected Exports"
@@ -890,9 +977,42 @@ runs:
         sed -i 's/protected_modules = \[.*\]/protected_modules = []/' common/modules.bzl || true
         echo "::endgroup::"
 
+    - name: Add selected KernelSU to OP15 r54
+      if: ${{ env.OP_MODEL == 'OP15-6.12.69' }}
+      shell: bash
+      env:
+        SELECTED_KSU_TYPE: ${{ inputs.ksu_type }}
+        SELECTED_KSU_REF: ${{ inputs.ksu_branch_or_hash }}
+      run: |
+        set -euo pipefail
+        cd "$KERNEL_PLATFORM_FOLDER"
+        case "$SELECTED_KSU_TYPE" in
+          KSUN) root_name=KernelSU-Next; root_url=https://github.com/KernelSU-Next/KernelSU-Next.git; root_ref=${SELECTED_KSU_REF:-dev} ;;
+          KSU) root_name=KernelSU; root_url=https://github.com/tiann/KernelSU.git; root_ref=${SELECTED_KSU_REF:-main} ;;
+          *) echo '::error::Select KSU or KSUN'; exit 1 ;;
+        esac
+        git clone --no-checkout "$root_url" "$root_name"
+        git -C "$root_name" fetch --no-tags origin "$root_ref"
+        git -C "$root_name" checkout --detach FETCH_HEAD
+        ln -s "../../$root_name/kernel" common/drivers/kernelsu
+        printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> common/drivers/Makefile
+        printf '\nsource "drivers/kernelsu/Kconfig"\n' >> common/drivers/Kconfig
+        printf '\nCONFIG_KSU=y\n' >> common/arch/arm64/configs/gki_defconfig
+        printf '\nccflags-y += -I$(srctree)/drivers/kernelsu/include/uapi\n' >> "$root_name/kernel/Kbuild"
+        commits=$(git -C "$root_name" rev-list --count HEAD)
+        base=30000
+        if [ "$SELECTED_KSU_TYPE" = KSUN ] && [ "$commits" -lt 2684 ]; then base=10200; fi
+        version=$((base + commits))
+        {
+          echo "KSUVER=$version"
+          echo "KSU_COMMIT_SHA=$(git -C "$root_name" rev-parse HEAD)"
+          echo 'NEED_HOOKS=false'
+        } >> "$GITHUB_ENV"
+        printf '%s\n%s\n' "$SELECTED_KSU_TYPE" "$version" >> "$ARTIFACTS_FOLDER/${OP_MODEL}_${OP_OS_VERSION}.txt"
+
     - name: Add KernelSU Next
       shell: bash
-      if: ${{ inputs.ksu_type == 'KSUN' }}
+      if: ${{ env.OP_MODEL != 'OP15-6.12.69' && (inputs.ksu_type == 'KSUN') }}
       run: |
         set -euo pipefail
         echo "::group::Add KernelSU Next"
@@ -954,7 +1074,7 @@ runs:
 
     - name: Add KernelSU
       shell: bash
-      if: ${{ inputs.ksu_type == 'KSU' }}
+      if: ${{ env.OP_MODEL != 'OP15-6.12.69' && (inputs.ksu_type == 'KSU') }}
       run: |
         set -euo pipefail
         echo "::group::Add KernelSU"
@@ -1000,9 +1120,249 @@ runs:
         echo "✅ KernelSU added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
+    - name: Apply selected SUSFS to OP15 r54
+      if: ${{ env.OP_MODEL == 'OP15-6.12.69' && env.OP_SUSFS == 'true' }}
+      shell: bash
+      env:
+        SELECTED_KSU_TYPE: ${{ inputs.ksu_type }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        #!/usr/bin/env python3
+        """Apply the selected SUSFS revision and WildKernels fixes to the selected root tree."""
+
+        import argparse
+        from pathlib import Path
+        import re
+        import subprocess
+
+
+        def recount(text):
+            text = ''.join(part for part in re.split(r'(?=^@@ |^diff --git )', text, flags=re.M)
+                           if not part.startswith('@@ ') or
+                           any(line.startswith(('+', '-')) for line in part.splitlines()[1:]))
+            lines = text.splitlines(True)
+            for index, line in enumerate(lines):
+                match = re.match(r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)', line)
+                if not match:
+                    continue
+                chunk = []
+                for value in lines[index + 1:]:
+                    if value.startswith(('@@ ', 'diff --git ', '--- ')):
+                        break
+                    chunk.append(value)
+                old = sum(value.startswith((' ', '-')) for value in chunk)
+                new = sum(value.startswith((' ', '+')) for value in chunk)
+                lines[index] = f'@@ -{match[1]},{old} +{match[2]},{new} @@{match[3]}\n'
+            return ''.join(lines)
+
+
+        def adapt_next(text, root):
+            # Next dev has sulog and preinit changes newer than the tiann enable patch.
+            # Retain Next's module parameters and manager checks; SUSFS changes below
+            # the banner still replace the hooks used by the built-in ARM64 kernel.
+            init = root / 'kernel/core/init.c'
+            if not init.exists() or '#include "preinit/preinit.h"' not in init.read_text():
+                return text
+            # Next's preinit feature flag still consults this built-in/LKM state.
+            # Keep both its definition and declaration alongside the retained init code.
+            text = text.replace('-bool ksu_late_loaded;\n', ' bool ksu_late_loaded;\n')
+            text = text.replace('-extern bool ksu_late_loaded;\n', ' extern bool ksu_late_loaded;\n')
+            parts = re.split(r'(?=^diff --git )', text, flags=re.M)
+            for index, part in enumerate(parts):
+                if part.startswith('diff --git a/kernel/core/init.c '):
+                    if '#include <linux/moduleparam.h>' not in init.read_text():
+                        part = part.replace(' #include <linux/moduleparam.h>\n', '')
+                    part = part.replace(' #include "feature/shell_su_adb_only.h"\n',
+                                        ' #include "feature/shell_su_adb_only.h"\n #include "feature/sulog.h"\n')
+                    part = ''.join(hunk for hunk in re.split(r'(?=^@@ )', part, flags=re.M)
+                                   if '-bool ksu_bundled' not in hunk)
+                elif part.startswith('diff --git a/kernel/feature/selinux_hide.c '):
+                    source = (root / 'kernel/feature/selinux_hide.c').read_text()
+                    if 'mutex_lock(&selinux_state.status_lock);' in source:
+                        part = part.replace('-        void *data = fake_status;\n',
+                                            '-        void *data;\n-        mutex_lock(&selinux_state.status_lock);\n'
+                                            '-        data = fake_status;\n-        mutex_unlock(&selinux_state.status_lock);\n')
+                parts[index] = part
+            return recount(''.join(parts))
+
+
+        def apply(root, text, label):
+            print(f'Applying {label}', flush=True)
+            return subprocess.run(['patch', '--batch', '--forward', '--ignore-whitespace',
+                                   '--no-backup-if-mismatch', '-p1', '-d', str(root)],
+                                  input=text, text=True).returncode
+
+
+        def finish_sucompat(root):
+            source = root / 'kernel/feature/sucompat.c'
+            text = source.read_text()
+            header = (root / 'kernel/runtime/ksud.h').read_text()
+            if 'static inline const char __user *get_user_arg_ptr(' in header:
+                # Both current root variants already provide this identical helper in
+                # ksud.h. The enable/fix patch also inserts a local definition.
+                pattern = (r'^static const char __user \*get_user_arg_ptr\('
+                           r'struct user_arg_ptr argv, int nr\)\n\{.*?^\}\n\n')
+                functions = re.findall(pattern, text, re.M | re.S)
+                if functions:
+                    inline = re.search(pattern.replace('static const', 'static inline const'), header, re.M | re.S)
+                    if not inline:
+                        raise RuntimeError('Cannot identify the existing get_user_arg_ptr helper')
+                    normalize = lambda value: re.sub(r'\s+', '', value.replace('static inline', 'static'))
+                    if len(functions) != 1 or normalize(functions[0]) != normalize(inline[0]):
+                        raise RuntimeError('get_user_arg_ptr implementations differ; review the selected revisions')
+                    text = re.sub(pattern, '', text, count=1, flags=re.M | re.S)
+            # The tiann patch uses four-space indents, while Next's surrounding code
+            # uses tabs. Normalize indentation to avoid -Wmisleading-indentation.
+            text = re.sub(r'^[ \t]+', lambda match: match[0].expandtabs(4), text, flags=re.M)
+            source.write_text(text)
+
+
+        def integrate(root, susfs, patches, variant):
+            version = re.search(r'^#define SUSFS_VERSION "([^"]+)"',
+                                (susfs / 'kernel_patches/include/linux/susfs.h').read_text(), re.M)[1]
+            fix_dir = patches / 'next/susfs_fix_patches' / version
+            text = (susfs / 'kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch').read_text()
+            if variant == 'KSUN':
+                text = adapt_next(text, root)
+            status = apply(root, text, 'SUSFS enable patch')
+            if status > 1:
+                raise RuntimeError('SUSFS enable patch is malformed or could not be read')
+            rejects = sorted(root.rglob('*.rej'))
+            if status and not rejects:
+                raise RuntimeError('SUSFS enable patch failed without reject files')
+            for reject in rejects:
+                fix = fix_dir / f'fix_{reject.stem}.patch'
+                text = fix.read_text()  # Missing fixes are an error, never silently ignored.
+                if reject.name == 'sucompat.c.rej':
+                    source = (root / 'kernel/feature/sucompat.c').read_text()
+                    required = ['DEFINE_STATIC_KEY_TRUE(ksu_su_compat_enabled);',
+                                'static_branch_enable(&ksu_su_compat_enabled);',
+                                'static_branch_disable(&ksu_su_compat_enabled);',
+                                '#include "feature/adb_root.h"', '#include "uapi/sulog.h"',
+                                'static const char ksud_path[] = KSUD_PATH;']
+                    # Current enable patch already supplies this hunk (with different
+                    # braces). Keep util.h, which is used by userspace_stack_buffer.
+                    if all(value in source for value in required) and 'hook/syscall_hook.h' not in source:
+                        hunks = re.split(r'(?=^@@ )', text, flags=re.M)
+                        text = hunks[0] + ''.join(hunks[2:])
+                if reject.name == 'dispatch.c.rej':
+                    source = (root / 'kernel/supercall/dispatch.c').read_text()
+                    preinit = ('    // A late load never sees PID 1\'s selinux_setup, so preinit cannot run.\n'
+                               '    if (ksu_preinit_enabled_param() && !ksu_late_loaded) {\n'
+                               '        cmd.flags |= KSU_GET_INFO_FLAG_PREINIT;\n    }\n')
+                    if preinit in source:
+                        text = text.replace('     cmd.features = KSU_FEATURE_MAX;\n',
+                                            ''.join(' ' + line for line in preinit.splitlines(True))
+                                            + '     cmd.features = KSU_FEATURE_MAX;\n', 1)
+                        text = recount(text)
+                # Delete the old reject first: patch may create a new one at this path.
+                reject.unlink()
+                if apply(root, text, fix.name):
+                    raise RuntimeError(f'Cannot apply {fix}; inspect the reject files')
+            if variant == 'KSUN':
+                for name in ('overwrite_hook_mode.patch', 'ksu_toolkit.patch'):
+                    if apply(root, (fix_dir / name).read_text(), name):
+                        raise RuntimeError(f'Cannot apply WildKernels {name}')
+            if list(root.rglob('*.rej')):
+                raise RuntimeError('Unresolved SUSFS reject files remain')
+            finish_sucompat(root)
+            if 'config KSU_SUSFS\n' not in (root / 'kernel/Kconfig').read_text():
+                raise RuntimeError('SUSFS configuration was not integrated')
+            print(f'Integrated {variant} + SUSFS {version}', flush=True)
+
+
+
+        """Adapt older SUSFS patch contexts to ACK android16-6.12-2026-03_r54."""
+
+        import argparse
+        from pathlib import Path
+        import re
+
+
+        def adapt_patch(text: str) -> str:
+            # r54 added dma-buf.h and renamed the page-count helper. Keep both
+            # upstream changes; only adjust the context used to locate SUSFS hunks.
+            replacements = (
+                (
+                    " #include <linux/user_events.h>\n"
+                    " #include <linux/rseq.h>\n"
+                    " #include <linux/ksm.h>\n",
+                    " #include <linux/rseq.h>\n"
+                    " #include <linux/ksm.h>\n"
+                    " #include <linux/dma-buf.h>\n",
+                ),
+                (
+                    " \tif (!vma_pages(vma))\n \t\tgoto show_pad;",
+                    " \tif (!vma_data_pages(vma))\n \t\tgoto show_pad;",
+                ),
+            )
+            for old, new in replacements:
+                if text.count(old) == 1:
+                    text = text.replace(old, new, 1)
+                elif new not in text:
+                    raise ValueError("Unexpected SUSFS patch context; check the selected source revisions")
+            # Newer 6.12 SUSFS patches target a rewritten smaps_rollup iterator.
+            # r54 still has three gather sites, including two after lock contention.
+            # Guard each gather while retaining the original iterator/lock handling.
+            parts = re.split(r'(?=^diff --git )', text, flags=re.M)
+            for index, part in enumerate(parts):
+                if not part.startswith('diff --git a/fs/proc/task_mmu.c '):
+                    continue
+                hunks = re.split(r'(?=^@@ )', part, flags=re.M)
+                rollup = [hunk for hunk in hunks if 'show_smaps_rollup' in hunk.splitlines()[0]]
+                if rollup and 'smap_gather_stats(priv, vma, &mss);' in ''.join(rollup):
+                    if len(rollup) != 2:
+                        raise ValueError('Unexpected SUSFS smaps_rollup patch; review for r54')
+                    replacement = ''
+                    for line, indent, start in [(1392, '\t\t', '0'), (1458, '\t\t\t\t', '0'),
+                                                (1465, '\t\t\t\t', 'last_vma_end')]:
+                        replacement += (f'@@ -{line},2 +{line},7 @@ static int show_smaps_rollup(struct seq_file *m, void *v)\n'
+                                        '+#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n'
+                                        f'+{indent}if (!(vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))\n'
+                                        f'+{indent}\tsmap_gather_stats(vma, &mss, {start});\n'
+                                        '+#else\n'
+                                        f' {indent}smap_gather_stats(vma, &mss, {start});\n'
+                                        '+#endif\n'
+                                        f' {indent}last_vma_end = vma->vm_end;\n')
+                    first = hunks.index(rollup[0])
+                    hunks[first] = replacement
+                    hunks.remove(rollup[1])
+                    parts[index] = ''.join(hunks)
+            text = ''.join(parts)
+            return text
+
+
+
+        import os
+        import shutil
+        variant = os.environ['SELECTED_KSU_TYPE']
+        root = Path(os.environ['KSUN_FOLDER'] if variant == 'KSUN' else os.environ['KSU_FOLDER'])
+        susfs = Path(os.environ['SUSFS_FOLDER'])
+        common = Path(os.environ['COMMON_KERNEL_FOLDER'])
+        patches = Path(os.environ['KERNEL_PATCHES_FOLDER'])
+        integrate(root, susfs, patches, variant)
+        for folder in ['fs', 'include/linux']:
+            for path in (susfs / 'kernel_patches' / folder).iterdir():
+                if path.is_file():
+                    shutil.copy2(path, common / folder / path.name)
+        patch = adapt_patch((susfs / 'kernel_patches/50_add_susfs_in_gki-android16-6.12.patch').read_text())
+        command = ['patch', '--batch', '--forward', '-p1', '-d', str(common)]
+        subprocess.run(command + ['--dry-run'], input=patch, text=True, check=True)
+        subprocess.run(command, input=patch, text=True, check=True)
+        with (common / 'arch/arm64/configs/gki_defconfig').open('a') as stream:
+            stream.write('\nCONFIG_KSU_SUSFS=y\n')
+        version = re.search(r'^#define SUSFS_VERSION "([^"]+)"',
+                            (common / 'include/linux/susfs.h').read_text(), re.M)[1]
+        with Path(os.environ['GITHUB_ENV']).open('a') as stream:
+            stream.write(f'SUSVER={version}\nNEED_HOOKS=false\n')
+        with (Path(os.environ['ARTIFACTS_FOLDER']) / f"{os.environ['OP_MODEL']}_{os.environ['OP_OS_VERSION']}.txt").open('a') as stream:
+            stream.write(version + '\n')
+        PY
+
     - name: Apply SUSFS Patches
       shell: bash
-      if: ${{ env.OP_SUSFS == 'true' }}
+      if: ${{ env.OP_MODEL != 'OP15-6.12.69' && (env.OP_SUSFS == 'true') }}
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS patches"
@@ -1281,6 +1641,40 @@ runs:
         echo "::group::Add BBG LSM"
         cd "$KERNEL_PLATFORM_FOLDER"
         echo "Adding BBG..."
+
+        if [ "$OP_MODEL" = OP15-6.12.69 ]; then
+          git clone --depth=1 https://github.com/vc-teahouse/Baseband-guard.git common/security/Baseband-guard
+          printf '\nobj-$(CONFIG_BBG) += Baseband-guard/\n' >> common/security/Makefile
+          printf '\nsource "security/Baseband-guard/Kconfig"\n' >> common/security/Kconfig
+          python3 - <<'PY'
+        from pathlib import Path
+        import subprocess
+        root = Path('common/security/Baseband-guard')
+        commit = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+        path = root / 'Makefile'
+        text = path.read_text()
+        start = text.index('GIT_BIN :=')
+        end = text.index('ifeq ($(shell grep -q "file_ioctl_compat"', start)
+        path.write_text(text[:start] + f'REPO_LINK := https://github.com/vc-teahouse/Baseband-guard\nCOMMIT_SHA := {commit[:8]}\n\n' + text[end:])
+        path = Path('common/include/linux/lsm_count.h')
+        text = path.read_text()
+        old = '#define MAX_LSM_COUNT\t\t\t\\\n'
+        assert text.count(old) == 1
+        text = text.replace(old, '#if IS_ENABLED(CONFIG_BBG)\n#define BBG_ENABLED 1,\n#else\n#define BBG_ENABLED\n#endif\n\n' + old)
+        old = '\t\tIPE_ENABLED)'
+        assert text.count(old) == 1
+        text = text.replace(old, '\t\tIPE_ENABLED\t\t\\\n\t\tBBG_ENABLED)')
+        path.write_text(text)
+        PY
+          patch --batch --forward -d common/security -p1 < "$KERNEL_PATCHES_FOLDER/common/bbg/0001-Enable-abl-and-efisp-flashing-for-efisp-exploit-devices.patch"
+          cat >> common/arch/arm64/configs/gki_defconfig <<'EOF'
+        CONFIG_BBG=y
+        CONFIG_BBG_BLOCK_BOOT=n
+        CONFIG_BBG_BLOCK_RECOVERY=n
+        CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,ipe,bpf,baseband_guard"
+        EOF
+          exit 0
+        fi
         if ! wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash -s main; then
           echo "::warning::BBG setup script failed, continuing anyway"
         fi
@@ -1309,6 +1703,7 @@ runs:
         echo "::endgroup::"
 
     - name: Apply Other Patches
+      if: ${{ env.OP_MODEL != 'OP15-6.12.69' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1478,9 +1873,17 @@ runs:
         fi
         
         echo "Patching add_limitation_scaling_min_freq.patch"
-        patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/add_limitation_scaling_min_freq.patch"
+        if [ "$OP_MODEL" != OP15-6.12.69 ]; then
+          patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/add_limitation_scaling_min_freq.patch"
+        else
+          echo "Skipping add_limitation_scaling_min_freq: requires a separate r54 port"
+        fi
         echo "Patching re_write_limitation_scaling_min_freq.patch"
-        patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/re_write_limitation_scaling_min_freq.patch"
+        if [ "$OP_MODEL" != OP15-6.12.69 ]; then
+          patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/re_write_limitation_scaling_min_freq.patch"
+        else
+          echo "Skipping re_write_limitation_scaling_min_freq: requires a separate r54 port"
+        fi
         echo "Patching adjust_cpu_scan_order.patch"
         patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/adjust_cpu_scan_order.patch"
         echo "Patching avoid_extra_s2idle_wake_attempts.patch"
@@ -1500,7 +1903,11 @@ runs:
         echo "Patching silence_system_logspam.patch"
         patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/silence_system_logspam.patch"
         echo "Patching use_unlikely_wrap_cpufreq.patch"
-        patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"
+        if [ "$OP_MODEL" != OP15-6.12.69 ]; then
+          patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"
+        else
+          echo "Skipping use_unlikely_wrap_cpufreq: requires a separate r54 port"
+        fi
         
         echo "✅ Optimisation Patches applied"
         echo "::endgroup::"
@@ -1541,7 +1948,7 @@ runs:
         fi
         
         echo "Using patch: $(basename $NTSYNC_PATCH)"
-        if [ "$ANDROID_VER" = "android16" ] && [ "$KERNEL_VER" = "6.12" ]; then
+        if [ "$ANDROID_VER" = "android16" ] && [ "$KERNEL_VER" = "6.12" ] && [ "$OP_MODEL" != OP15-6.12.69 ]; then
           echo "Removing pre-existing ntsync files for android16-6.12"
           rm -f include/uapi/linux/ntsync.h
           rm -f drivers/misc/ntsync.c
@@ -1549,6 +1956,9 @@ runs:
         
         echo "Patching $(basename $NTSYNC_PATCH)!"
         patch -p1 --forward < "$NTSYNC_PATCH"
+        if [ "$OP_MODEL" = OP15-6.12.69 ]; then
+          rm -f drivers/misc/ntsync.c include/uapi/linux/ntsync.h
+        fi
         echo "Patching ntsync_base!"
         patch -p1 --forward < "$NTSYNC_FOLDER/ntsync_base.patch"
         cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
@@ -1751,6 +2161,20 @@ runs:
         CONFIG_FRAME_WARN=0
         CONFIG_TRACEPOINTS=y
         EOF
+        if [ "$OP_MODEL" = OP15-6.12.69 ]; then
+          # Built-in IPSet/NAT targets need built-in netfilter prerequisites.
+          cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<'EOF'
+        CONFIG_NET_SCHED=y
+        CONFIG_NETFILTER=y
+        CONFIG_NETFILTER_ADVANCED=y
+        CONFIG_NETFILTER_XTABLES=y
+        CONFIG_IP_NF_IPTABLES=y
+        CONFIG_IP_NF_MANGLE=y
+        CONFIG_IP6_NF_IPTABLES=y
+        CONFIG_IP6_NF_MANGLE=y
+        CONFIG_NF_NAT=y
+        EOF
+        fi
 
     - name: Add RUST build configs
       shell: bash
@@ -1762,21 +2186,6 @@ runs:
         CONFIG_ANDROID_BINDER_IPC_RUST=m
         CONFIG_RUST=y
         EOF
-
-    - name: Save Build Metadata
-      id: save_metadata
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "Save Build Metadata"
-        cd "$ARTIFACTS_FOLDER"
-        echo "kernel_version=${{ env.KERNEL_FULL_VER }}" >> "$GITHUB_OUTPUT"
-        echo "ksu_version=${KSUVER:-unknown}" >> "$GITHUB_OUTPUT"
-        echo "ksu_type=${{ inputs.ksu_type }}" >> "$GITHUB_OUTPUT"
-        echo "build_timestamp=${EFFECTIVE_BUILD_TIMESTAMP:-unknown}" >> "$GITHUB_OUTPUT"
-        if [ "${{ env.OP_SUSFS }}" = true ]; then
-          echo "susfs_version=${SUSVER:-unknown}" >> "$GITHUB_OUTPUT"
-        fi
 
     - name: Customize Kernel Branding
       shell: bash
@@ -1797,6 +2206,7 @@ runs:
         sed -i '/obj-y.*gpueb/d' "$COMMON_KERNEL_FOLDER/drivers/gpu/mediatek/Makefile"
 
     - name: Apply Fake config.gz patch
+      if: ${{ env.OP_MODEL != 'OP15-6.12.69' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1818,6 +2228,7 @@ runs:
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
     
     - name: Disable Vendor / Kernel Modules
+      if: ${{ env.OP_MODEL != 'OP15-6.12.69' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -1886,9 +2297,72 @@ runs:
       shell: bash
       env:
         PYTHONWARNINGS: "ignore:invalid escape sequence"
+        SELECTED_OPTIMIZE: ${{ inputs.optimize_level }}
+        SELECTED_TIMESTAMP: ${{ inputs.build_timestamp }}
+        SELECTED_CLEAN: ${{ inputs.clean }}
       run: |
         set -euo pipefail
         echo "::group::Build kernel with ccache optimization"
+
+        if [ "$OP_MODEL" = OP15-6.12.69 ]; then
+          cd "$KERNEL_PLATFORM_FOLDER"
+          python3 - <<'PY'
+        from pathlib import Path
+        import os
+        path = Path('common/BUILD.bazel')
+        text = path.read_text()
+        anchor = '    name = "kernel_aarch64",\n'
+        assert text.count(anchor) == 1
+        start = text.index(anchor)
+        end = text.index('\n)', start)
+        target = text[start:end].replace(anchor, anchor + '    check_defconfig = "disabled",\n', 1)
+        if os.environ['SELECTED_OPTIMIZE'] == 'O3':
+            assert target.count('kcflags = COMMON_KCFLAGS,') == 1
+            target = target.replace('kcflags = COMMON_KCFLAGS,', 'kcflags = COMMON_KCFLAGS + ["-O3"],')
+        path.write_text(text[:start] + target + text[end:])
+        PY
+          available=$(df -Pk . | awk 'NR==2 {print $4}')
+          [ "$available" -ge $((12 * 1024 * 1024)) ] || { echo '::error::Need 12GiB free before OP15 build'; exit 1; }
+          if [ -n "$SELECTED_TIMESTAMP" ]; then
+            SOURCE_DATE_EPOCH=$(date -d "$SELECTED_TIMESTAMP" +%s)
+          else
+            SOURCE_DATE_EPOCH=$(date +%s)
+          fi
+          export SOURCE_DATE_EPOCH
+          stamp=$(date -u -d "@$SOURCE_DATE_EPOCH" '+%a %b %e %T UTC %Y')
+          start=$(date +%s)
+          if [ "$SELECTED_CLEAN" = true ]; then tools/bazel clean; fi
+          dist="$KERNEL_PLATFORM_FOLDER/out/android16-6.12/dist"
+          tools/bazel run --config=local --config=stamp --lto=none --notrim --jobs=2 \
+            //common:kernel_aarch64_dist -- --destdir="$dist" 2>&1 | tee "$COMMON_KERNEL_FOLDER/build.log"
+          python3 - <<'PY'
+        import mmap, os, re, struct
+        from pathlib import Path
+        dist = Path(os.environ['KERNEL_PLATFORM_FOLDER']) / 'out/android16-6.12/dist'
+        config = (dist / 'kernel_aarch64_dot_config').read_text().splitlines()
+        required = ['CONFIG_MODVERSIONS=y', 'CONFIG_GENDWARFKSYMS=y', 'CONFIG_ARM64_4K_PAGES=y', 'CONFIG_KSU=y']
+        if os.environ['OP_SUSFS'] == 'true': required.append('CONFIG_KSU_SUSFS=y')
+        if os.environ['OP_BBG'] == 'true': required.append('CONFIG_BBG=y')
+        for value in required: assert value in config, f'Missing {value}'
+        with (dist / 'Image').open('rb') as stream: header = stream.read(64)
+        assert header[56:60] == b'ARM\x64' and (struct.unpack_from('<Q', header, 24)[0] >> 1) & 3 == 1
+        with (dist / 'vmlinux').open('rb') as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as binary:
+            assert re.search(rb'Linux version 6\.12\.69-android16-6[^\x00\n]*', binary)
+            match = re.search(rb'welcome to KernelSU(?:-Next)? version ([0-9]+)', binary)
+            assert match and int(match[1]) > 1, 'Missing compiled KernelSU version'
+            version = match[1].decode()
+        with Path(os.environ['GITHUB_ENV']).open('a') as stream: stream.write(f'KSUVER={version}\n')
+        (Path(os.environ['DEBUG_ARTIFACTS_FOLDER']) / 'kernel_aarch64_dot_config').write_text('\n'.join(config) + '\n')
+        PY
+          end=$(date +%s)
+          {
+            echo "BUILD_START=$start"
+            echo "BUILD_END=$end"
+            echo "BUILD_TIME=$((end - start))"
+            echo "EFFECTIVE_BUILD_TIMESTAMP=$stamp"
+          } >> "$GITHUB_ENV"
+          exit 0
+        fi
         
         cd "$COMMON_KERNEL_FOLDER"
         : > "$COMMON_KERNEL_FOLDER/.scmversion"
@@ -2218,6 +2692,21 @@ runs:
         echo "   - Build time: ${BUILD_TIME}s"
         echo "::endgroup::"
 
+    - name: Save Build Metadata
+      id: save_metadata
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Save Build Metadata"
+        cd "$ARTIFACTS_FOLDER"
+        echo "kernel_version=${{ env.KERNEL_FULL_VER }}" >> "$GITHUB_OUTPUT"
+        echo "ksu_version=${KSUVER:-unknown}" >> "$GITHUB_OUTPUT"
+        echo "ksu_type=${{ inputs.ksu_type }}" >> "$GITHUB_OUTPUT"
+        echo "build_timestamp=${EFFECTIVE_BUILD_TIMESTAMP:-unknown}" >> "$GITHUB_OUTPUT"
+        if [ "${{ env.OP_SUSFS }}" = true ]; then
+          echo "susfs_version=${SUSVER:-unknown}" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Create Kernel ZIP
       id: create_zip
       shell: bash
@@ -2246,7 +2735,7 @@ runs:
         sed -i 's/do.check_boot_version=.*/do.check_boot_version=1/' anykernel.sh
         
         case "$OP_BRANCH" in
-          wild/sm8850|wild/sm8845)
+          wild/sm8850|wild/sm8845|wild/op15-gki-r54)
             echo "Applying BBG efisp abl whitelist control patch"
             patch -p1 < "$KERNEL_PATCHES_FOLDER/common/bbg/0001-Enable-volume-input-to-enable-bbg-efisp-patch.patch"
           ;;
@@ -2257,6 +2746,9 @@ runs:
           ZIP_NAME="AK3_${ZIP_MODEL}_${OP_OS_VERSION}_${KERNEL_FULL_VER}_${{ inputs.ksu_type }}_${KSUVER:-unknown}_SuSFS_${SUSVER:-unknown}.zip"
         else
           ZIP_NAME="AK3_${ZIP_MODEL}_${OP_OS_VERSION}_${KERNEL_FULL_VER}_${{ inputs.ksu_type }}_${KSUVER:-unknown}.zip"
+        fi
+        if [ "$OP_MODEL" = OP15-6.12.69 ]; then
+          ZIP_NAME="${ZIP_NAME%.zip}_KMI6_4k.zip"
         fi
         mkdir -p "$ARTIFACTS_FOLDER"
         
@@ -2274,6 +2766,10 @@ runs:
         
         find "$ARTIFACTS_FOLDER" -maxdepth 1 -type f ! -name "$ZIP_NAME" -delete
         
+        if [ "$OP_MODEL" = OP15-6.12.69 ]; then
+          cp "$IMAGE_PATH" "$ARTIFACTS_FOLDER/Image"
+        fi
+
         ZIP_SIZE=$(stat -c%s "$ARTIFACTS_FOLDER/$ZIP_NAME")
         ZIP_SHA256=$(sha256sum "$ARTIFACTS_FOLDER/$ZIP_NAME" | awk '{print $1}')
         printf 'zip_sha256=%s\n' "$ZIP_SHA256" >> "$GITHUB_OUTPUT"
@@ -2437,6 +2933,16 @@ runs:
         path: ${{ env.ARTIFACTS_FOLDER }}/${{ env.ZIP_NAME }}
         archive: false
         compression-level: 0
+        retention-days: 90
+
+    - name: Upload OP15 kernel Image
+      if: success() && env.OP_MODEL == 'OP15-6.12.69'
+      uses: actions/upload-artifact@v7
+      with:
+        name: Image-${{ env.OP_MODEL }}-${{ inputs.ksu_type }}
+        path: ${{ env.ARTIFACTS_FOLDER }}/Image
+        archive: false
+        if-no-files-found: error
         retention-days: 90
 
     - name: Upload ccache log

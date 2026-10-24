@@ -1,11 +1,11 @@
 name: 'Disk Cleanup'
+description: 'Free disk space on the GitHub Actions build runner'
 
 inputs:
   debug:
     description: 'Enable Logs'
     required: false
-    type: boolean
-    default: false
+    default: 'false'
 
 runs:
   using: 'composite'

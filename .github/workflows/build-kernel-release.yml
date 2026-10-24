@@ -17,6 +17,7 @@ on:
         required: true
         type: choice
         options:
+          - OP15-6.12.69
           - A14+15+16
           - A15+16
           - A14+15
@@ -137,6 +138,9 @@ jobs:
           jq_filter="."
           
           case "$input" in
+            OP15-6.12.69)
+              jq_filter='map(select(.model == "OP15-6.12.69"))'
+              ;;
             A14+15+16)
               ;;
             A15+16)
@@ -207,8 +211,10 @@ jobs:
           
           echo "count=$count" >> "$GITHUB_OUTPUT"
           
-          ksu_type=$(echo "$ksu_options_normalized" | jq -r '.[0].type')
-          ksu_ref=$(echo "$ksu_options_normalized" | jq -r '.[0].hash')
+          # A KSU and a KSUN entry must resolve against their own repositories.
+          while IFS= read -r option; do
+          ksu_type=$(jq -r '.type' <<< "$option")
+          ksu_ref=$(jq -r '.hash' <<< "$option")
           
           if [ "$ksu_type" == "KSUN" ]; then
             KSU_REPO_OWNER="KernelSU-Next"
@@ -236,8 +242,8 @@ jobs:
           echo "Resolving $ksu_type hash ($ksu_ref)..."
           
           until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
-            RESULT=$(gh api graphql -f query="$QUERY" -f owner="$KSU_REPO_OWNER" -f name="$KSU_REPO_NAME" -f headRef="$HEAD_REF" -f tagRef="$TAG_REF" -f objRef="$ksu_ref" 2>/dev/null)
-            EXIT_CODE=$?
+            EXIT_CODE=0
+            RESULT=$(gh api graphql -f query="$QUERY" -f owner="$KSU_REPO_OWNER" -f name="$KSU_REPO_NAME" -f headRef="$HEAD_REF" -f tagRef="$TAG_REF" -f objRef="$ksu_ref" 2>/dev/null) || EXIT_CODE=$?
             
             if [ $EXIT_CODE -eq 0 ] && [ ! -z "$RESULT" ]; then
               echo "  ✅ API Success"
@@ -262,10 +268,12 @@ jobs:
           fi
           
           echo "  ✅ Resolved: $ksu_type/$ksu_ref → $resolved_sha"
-          echo "ksu_resolved_hash=$resolved_sha" >> "$GITHUB_OUTPUT"
           
           # Inject ksu_resolved_hash into each device in the matrix
-          merged_matrix=$(echo "$merged_matrix" | jq  --arg resolved_sha "$resolved_sha" 'map(.ksu_resolved_hash = $resolved_sha)')
+          merged_matrix=$(echo "$merged_matrix" | jq --arg type "$ksu_type" --arg ref "$ksu_ref" --arg resolved_sha "$resolved_sha" \
+            'map(if .ksu_type == $type and .ksu_hash == $ref then .ksu_resolved_hash = $resolved_sha else . end)')
+          done < <(jq -c 'unique_by([.type, .hash])[]' <<< "$ksu_options_normalized")
+          echo "ksu_resolved_hash=$(jq -r '.[0].ksu_resolved_hash' <<< "$merged_matrix")" >> "$GITHUB_OUTPUT"
           
           # SUSFS hash fetch
           SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
